@@ -1,30 +1,17 @@
 #!/usr/bin/env python3
 """
-vpngate6_multi.py - Multi-Channel (6) VPN Gateway Manager
-Each channel: independent OpenVPN + tunN + proxy port 7928+N
+vpngate6_multi.py - 6-Channel VPN Gateway + Node Management UI
+Combines: multi-tunnel + full node table (IP info, filters, assign to channels)
 """
 from __future__ import annotations
-import base64
-import csv
-import io
-import json
-import os
-import random
-import re
-import shlex
-import socket
-import subprocess
-import sys
-import threading
-import time
-import urllib.request
-import urllib.parse
+import base64, csv, io, json, os, random, re, shlex, socket, subprocess, sys
+import threading, time, urllib.request, urllib.parse
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+import vpn_utils
 
-# === Constants ===
 NUM_CHANNELS = 6
 PROXY_BASE_PORT = 7928
 UI_PORT = 8787
@@ -39,11 +26,13 @@ CONFIG_DIR = DATA_DIR / "configs"
 NODES_FILE = DATA_DIR / "nodes.json"
 AUTH_FILE = DATA_DIR / "vpngate_auth.txt"
 CHANNELS_FILE = DATA_DIR / "channels.json"
+IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
+BLACKLIST_FILE = DATA_DIR / "blacklist.json"
 
 DATA_DIR.mkdir(exist_ok=True, parents=True)
 CONFIG_DIR.mkdir(exist_ok=True, parents=True)
 if not AUTH_FILE.exists():
-    AUTH_FILE.write_text(f"vpn\nvpn\n")
+    AUTH_FILE.write_text("vpn\nvpn\n")
     AUTH_FILE.chmod(0o600)
 
 # === Channel State ===
@@ -58,6 +47,9 @@ class Channel:
         self.node_name = ""
         self.node_ip = ""
         self.node_country = ""
+        self.node_owner = ""
+        self.node_location = ""
+        self.node_ip_type = ""
         self.node_latency = 0
         self.process: subprocess.Popen[str] | None = None
         self.error = ""
@@ -65,186 +57,115 @@ class Channel:
         self.lock = threading.Lock()
 
     def to_dict(self) -> dict:
-        return {
-            "index": self.index,
-            "tun": self.tun,
-            "proxy_port": self.proxy_port,
-            "force_country": self.force_country,
-            "state": self.state,
-            "node_id": self.node_id,
-            "node_name": self.node_name,
-            "node_ip": self.node_ip,
-            "node_country": self.node_country,
-            "node_latency": self.node_latency,
-            "error": self.error,
-        }
+        d = {"index": self.index, "tun": self.tun, "proxy_port": self.proxy_port,
+             "force_country": self.force_country, "state": self.state,
+             "node_id": self.node_id, "node_name": self.node_name, "node_ip": self.node_ip,
+             "node_country": self.node_country, "node_owner": self.node_owner,
+             "node_location": self.node_location, "node_ip_type": self.node_ip_type,
+             "node_latency": self.node_latency, "error": self.error}
+        return d
 
 channels: list[Channel] = [Channel(i) for i in range(NUM_CHANNELS)]
 nodes_cache: list[dict[str, Any]] = []
 nodes_cache_lock = threading.Lock()
 
-# === Helpers ===
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def read_json(path: Path) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    try: return json.loads(path.read_text(encoding="utf-8"))
+    except: return {}
 
 def write_json(path: Path, data: Any):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def get_openvpn_version() -> float:
-    try:
-        r = subprocess.run(["openvpn", "--version"], capture_output=True, text=True, timeout=2)
-        m = re.search(r"(\d+\.\d+)", r.stdout)
-        if m:
-            return float(m.group(1))
+def stop_process(proc: subprocess.Popen[str] | None):
+    if proc is None: return
+    try: proc.terminate(); proc.wait(timeout=3)
     except:
-        pass
-    return 2.4
-
-def stop_process(proc: subprocess.Popen[str] | None) -> None:
-    if proc is None:
-        return
-    try:
-        proc.terminate()
-        proc.wait(timeout=3)
-    except:
-        try:
-            proc.kill()
-            proc.wait(timeout=2)
-        except:
-            pass
+        try: proc.kill(); proc.wait(timeout=2)
+        except: pass
 
 def cleanup_policy_routing(table: int):
-    try:
-        subprocess.run(["ip", "rule", "del", "table", str(table)], capture_output=True, timeout=2)
-    except:
-        pass
-    try:
-        subprocess.run(["ip", "route", "flush", "table", str(table)], capture_output=True, timeout=2)
-    except:
-        pass
+    try: subprocess.run(["ip","rule","del","table",str(table)], capture_output=True, timeout=2)
+    except: pass
+    try: subprocess.run(["ip","route","flush","table",str(table)], capture_output=True, timeout=2)
+    except: pass
 
 def setup_policy_routing(tun_dev: str, table: int):
     cleanup_policy_routing(table)
     try:
-        subprocess.run(["ip", "route", "add", "default", "dev", tun_dev, "table", str(table)], check=True, timeout=2)
-        subprocess.run(["ip", "rule", "add", "oif", tun_dev, "table", str(table)], check=True, timeout=2)
-        for p in ["all", "default", tun_dev]:
-            try:
-                subprocess.run(["sysctl", "-w", f"net.ipv4.conf.{p}.rp_filter=2"], capture_output=True, timeout=2)
-            except:
-                pass
+        subprocess.run(["ip","route","add","default","dev",tun_dev,"table",str(table)], check=True, timeout=2)
+        subprocess.run(["ip","rule","add","oif",tun_dev,"table",str(table)], check=True, timeout=2)
+        for p in ["all","default",tun_dev]:
+            try: subprocess.run(["sysctl","-w",f"net.ipv4.conf.{p}.rp_filter=2"], capture_output=True, timeout=2)
+            except: pass
         log(f"[route {tun_dev}] table {table} OK")
-    except Exception as e:
-        log(f"[route {tun_dev}] Failed: {e}")
+    except Exception as e: log(f"[route {tun_dev}] Failed: {e}")
 
-# === OpenVPN ===
 def openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
-    cmd = ["openvpn", "--config", config_file, "--dev", tun_dev, "--dev-type", "tun",
-           "--pull-filter", "ignore", "route-ipv6", "--pull-filter", "ignore", "ifconfig-ipv6",
-           "--route-delay", "2", "--connect-retry-max", "1", "--connect-timeout", "15",
-           "--auth-user-pass", str(AUTH_FILE), "--auth-nocache", "--verb", "3",
-           "--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
+    cmd = ["openvpn","--config",config_file,"--dev",tun_dev,"--dev-type","tun",
+           "--pull-filter","ignore","route-ipv6","--pull-filter","ignore","ifconfig-ipv6",
+           "--route-delay","2","--connect-retry-max","1","--connect-timeout","15",
+           "--auth-user-pass",str(AUTH_FILE),"--auth-nocache","--verb","3",
+           "--data-ciphers","AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
            "--route-nopull"]
-    if Path("/etc/ssl/certs").exists():
-        cmd.extend(["--capath", "/etc/ssl/certs"])
+    if Path("/etc/ssl/certs").exists(): cmd.extend(["--capath","/etc/ssl/certs"])
     return cmd
 
 def connect_channel(ch: Channel, node: dict) -> bool:
     with ch.lock:
-        if ch.process:
-            stop_process(ch.process)
-            ch.process = None
+        stop_process(ch.process); ch.process = None
         cleanup_policy_routing(100 + ch.index)
         ch.state = "connecting"
-        ch.node_id = node.get("id", "")
-        ch.node_name = node.get("hostname", node.get("ip", ""))
-        ch.node_ip = node.get("ip", node.get("remote_host", ""))
-        ch.node_country = node.get("country_long", node.get("country", ""))
+        ch.node_id = node.get("id","")
+        ch.node_name = node.get("hostname",node.get("ip",""))
+        ch.node_ip = node.get("ip",node.get("remote_host",""))
+        ch.node_country = node.get("country_long",node.get("country",""))
+        ch.node_owner = node.get("owner","")
+        ch.node_location = node.get("location","")
+        ch.node_ip_type = node.get("ip_type","")
         ch.error = ""
-
-    config_text = node.get("config_text", "")
+    config_text = node.get("config_text","")
     config_path = CONFIG_DIR / f"ch{ch.index}.ovpn"
     config_path.write_text(config_text)
-
     cmd = openvpn_cmd(str(config_path), ch.tun)
     log(f"[CH{ch.index}] Starting {ch.tun}...")
-
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     except Exception as e:
-        ch.state = "error"
-        ch.error = str(e)
-        return False
-
-    ok = False
-    deadline = time.time() + 35
-    tail = []
+        ch.state = "error"; ch.error = str(e); return False
+    ok = False; deadline = time.time() + 35; tail = []
     while time.time() < deadline:
-        try:
-            line = proc.stdout.readline()
-        except:
-            break
-        if not line:
-            break
-        line = line.strip()
-        tail.append(line)
-        tail = tail[-20:]
-        if "initialization sequence completed" in line.lower():
-            ok = True
-            break
+        try: line = proc.stdout.readline()
+        except: break
+        if not line: break
+        line = line.strip(); tail.append(line); tail = tail[-20:]
+        if "initialization sequence completed" in line.lower(): ok = True; break
         if "auth_failed" in line.lower() or "authentication failed" in line.lower():
-            ch.state = "error"
-            ch.error = "AUTH_FAILED"
-            stop_process(proc)
-            return False
-
+            ch.state = "error"; ch.error = "AUTH_FAILED"; stop_process(proc); return False
     if not ok:
-        stop_process(proc)
-        ch.state = "error"
-        ch.error = tail[-1][:200] if tail else "timeout"
-        log(f"[CH{ch.index}] Failed: {ch.error}")
-        return False
-
-    with ch.lock:
-        ch.process = proc
-        ch.state = "connected"
-        ch.last_heartbeat = time.time()
-
+        stop_process(proc); ch.state = "error"; ch.error = tail[-1][:200] if tail else "timeout"; return False
+    with ch.lock: ch.process = proc; ch.state = "connected"; ch.last_heartbeat = time.time()
     setup_policy_routing(ch.tun, 100 + ch.index)
-    log(f"[CH{ch.index}] Connected! {ch.tun} :{ch.proxy_port}")
+    log(f"[CH{ch.index}] Connected! {ch.tun} :{ch.proxy_port} {ch.node_ip}")
     return True
 
 def disconnect_channel(ch: Channel):
     with ch.lock:
-        stop_process(ch.process)
-        ch.process = None
+        stop_process(ch.process); ch.process = None
         cleanup_policy_routing(100 + ch.index)
-        ch.state = "disconnected"
-        ch.node_id = ""
-        ch.node_name = ""
-        ch.node_ip = ""
-        ch.node_country = ""
-        ch.node_latency = 0
-        ch.error = ""
-    try:
-        (CONFIG_DIR / f"ch{ch.index}.ovpn").unlink(missing_ok=True)
-    except:
-        pass
+        ch.state = "disconnected"; ch.node_id = ""; ch.node_name = ""; ch.node_ip = ""
+        ch.node_country = ""; ch.node_owner = ""; ch.node_location = ""; ch.node_ip_type = ""
+        ch.node_latency = 0; ch.error = ""
+    try: (CONFIG_DIR / f"ch{ch.index}.ovpn").unlink(missing_ok=True)
+    except: pass
     log(f"[CH{ch.index}] Disconnected")
 
-# === Proxy ===
 def start_all_proxies():
     import proxy_server_multi as proxy
     for ch in channels:
-        threading.Thread(target=proxy.start_proxy_server,
-                         args=(LOCAL_PROXY_HOST, ch.proxy_port, ch.tun),
-                         daemon=True).start()
+        threading.Thread(target=proxy.start_proxy_server, args=(LOCAL_PROXY_HOST, ch.proxy_port, ch.tun), daemon=True).start()
         time.sleep(0.1)
 
 # === Node Fetching ===
@@ -254,62 +175,38 @@ def fetch_nodes() -> list[dict[str, Any]]:
         req = urllib.request.Request(API_URL, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        log(f"[fetch] Failed: {e}")
-        return []
-
+    except Exception as e: log(f"[fetch] Failed: {e}"); return []
     lines = raw.strip().split("\n")
     start = 0
-    if lines and lines[0].startswith("*"):
-        start = 1
-    if len(lines) <= start + 1:
-        return []
-
+    if lines and lines[0].startswith("*"): start = 1
+    if len(lines) <= start + 1: return []
     csv_text = "\n".join(lines[start:])
     reader = csv.DictReader(io.StringIO(csv_text))
-    nodes = []
-    seen = set()
+    nodes = []; seen = set()
     for row in reader:
-        node_id = row.get("#HostName", row.get("HostName", "")).strip()
-        if not node_id or node_id in seen:
-            continue
+        node_id = (row.get("#HostName") or row.get("HostName") or "").strip()
+        if not node_id or node_id in seen: continue
         seen.add(node_id)
-        ip = row.get("IP", "").strip()
-        port = row.get("Port", "443").strip()
-        country = row.get("CountryLong", "").strip()
-        config_b64 = row.get("OpenVPN_ConfigData_Base64", "").strip()
-        if not config_b64:
-            continue
-        try:
-            config_text = base64.b64decode(config_b64).decode("utf-8", errors="replace")
-        except:
-            continue
-        try:
-            ping_val = int(row.get("Ping", "0").strip())
-        except:
-            ping_val = 0
-        speed = row.get("Speed", "0").strip()
-        try:
-            speed_val = int(speed) if speed else 0
-        except:
-            speed_val = 0
-        nodes.append({
-            "id": node_id, "ip": ip, "port": port,
-            "country_long": country, "ping": ping_val,
-            "speed": speed_val, "config_text": config_text,
-        })
-
+        ip = (row.get("IP") or "").strip()
+        port = (row.get("Port") or "443").strip()
+        country = (row.get("CountryLong") or "").strip()
+        config_b64 = (row.get("OpenVPN_ConfigData_Base64") or "").strip()
+        if not config_b64 or not ip: continue
+        try: config_text = base64.b64decode(config_b64).decode("utf-8", errors="replace")
+        except: continue
+        try: ping_val = int((row.get("Ping") or "0").strip())
+        except: ping_val = 0
+        speed = (row.get("Speed") or "0").strip()
+        try: speed_val = int(speed) if speed else 0
+        except: speed_val = 0
+        nodes.append({"id":node_id, "ip":ip, "port":port, "country_long":country, "ping":ping_val,
+                       "speed":speed_val, "config_text":config_text, "hostname":node_id})
     def score(n):
         p = max(1, n["ping"]) if n["ping"] > 0 else 999
         s = n["speed"] if n["speed"] > 0 else 999
         return p + (s if s < 100 else s * 2)
-
     nodes.sort(key=score)
-    nodes = nodes[:200]
-
-    stripped = [{k: v for k, v in n.items() if k != "config_text"} for n in nodes]
-    write_json(NODES_FILE, stripped)
-    log(f"[fetch] {len(nodes)} nodes")
+    nodes = nodes[:300]
     return nodes
 
 def collector_loop():
@@ -318,107 +215,224 @@ def collector_loop():
         try:
             nodes = fetch_nodes()
             if nodes:
-                with nodes_cache_lock:
-                    nodes_cache = nodes
-        except Exception as e:
-            log(f"[collector] Error: {e}")
+                try: vpn_utils.enrich_ip_info(nodes)
+                except Exception as e: log(f"[enrich] Error: {e}")
+                with nodes_cache_lock: nodes_cache = nodes
+                stripped = []
+                for n in nodes:
+                    s = {k:v for k,v in n.items() if k != "config_text"}
+                    stripped.append(s)
+                write_json(NODES_FILE, stripped)
+                log(f"[fetch] {len(nodes)} nodes, enriched")
+        except Exception as e: log(f"[collector] Error: {e}")
         time.sleep(FETCH_INTERVAL)
 
 # === Channel Manager ===
 def get_best_node_for_country(country: str) -> dict | None:
-    with nodes_cache_lock:
-        candidates = list(nodes_cache)
-    if not candidates:
-        return None
-    if country:
-        filtered = [n for n in candidates if country.lower() in n.get("country_long", "").lower()]
-        if not filtered:
-            return None
-        candidates = filtered
-    pool = candidates[:min(30, len(candidates))]
+    with nodes_cache_lock: candidates = list(nodes_cache)
+    if not candidates: return None
+    if country: filtered = [n for n in candidates if country.lower() in n.get("country_long","").lower()]
+    else: filtered = candidates
+    if not filtered: return None
+    pool = filtered[:min(30, len(filtered))]
     return random.choice(pool) if pool else None
 
+def get_node_by_id(node_id: str) -> dict | None:
+    with nodes_cache_lock:
+        for n in nodes_cache:
+            if n.get("id") == node_id: return n
+    return None
+
 # === Web UI ===
-CHANNELS_HTML = r"""<!doctype html>
+PAGE_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>AimiliVPN 多通道</title>
+<title>AimiliVPN 6通道</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f0f13;color:#e0e0e0}
-.header{padding:20px 24px;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:12px}
-.header h1{font-size:20px;font-weight:600}
-.badge{background:#22c55e20;color:#22c55e;font-size:12px;padding:2px 10px;border-radius:12px;border:1px solid #22c55e30}
-#node_count{margin-left:auto;color:#6b7280;font-size:13px}
-.grid{padding:20px 24px;display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f0f13;color:#e0e0e0;font-size:14px}
+.hd{padding:16px 20px;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.hd h1{font-size:18px;font-weight:600}
+.bdg{background:#22c55e20;color:#22c55e;font-size:11px;padding:2px 10px;border-radius:10px;border:1px solid #22c55e30}
+.nc{margin-left:auto;color:#6b7280;font-size:13px}
+.grid{padding:12px 16px;display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 @media(max-width:900px){.grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:600px){.grid{grid-template-columns:1fr}}
-.card{background:#1a1a24;border:1px solid rgba(255,255,255,0.06);border-radius:16px;padding:20px}
-.card.ok{border-color:#22c55e40;background:#1a2a1e}
-.card.busy{border-color:#f59e0b40;background:#2a2418}
+.card{background:#1a1a24;border:1px solid rgba(255,255,255,0.06);border-radius:12px;padding:14px}
+.card.on{border-color:#22c55e40;background:#1a2a1e}
+.card.bz{border-color:#f59e0b40;background:#2a2418}
 .card.fail{border-color:#ef444440;background:#2a1818}
-.flex{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
-.ct{font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
-.cn{background:#818cf820;color:#818cf8;font-size:11px;padding:2px 8px;border-radius:6px}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
-.dot.g{background:#22c55e;box-shadow:0 0 8px #22c55e60}
-.dot.y{background:#f59e0b;box-shadow:0 0 8px #f59e0b60}
-.dot.r{background:#ef4444;box-shadow:0 0 8px #ef444460}
-.dot.g2{background:#6b7280}
-.body{font-size:13px;color:#9ca3af;line-height:1.8}
-.l{color:#6b7280;font-size:11px}
-.act{display:flex;gap:8px;margin-top:14px}
-select{flex:1;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;padding:8px 10px;font-size:13px;outline:none}
-select:focus{border-color:#818cf8}
-.btn{background:#818cf8;border:none;color:#fff;padding:8px 16px;border-radius:8px;font-size:13px;cursor:pointer;font-weight:500}
+.chf{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.ct{font-size:14px;font-weight:600;display:flex;align-items:center;gap:6px}
+.cn{background:#818cf820;color:#818cf8;font-size:10px;padding:2px 8px;border-radius:6px}
+.dt{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+.dt.g{background:#22c55e;box-shadow:0 0 6px #22c55e60}
+.dt.y{background:#f59e0b;box-shadow:0 0 6px #f59e0b60}
+.dt.r{background:#ef4444;box-shadow:0 0 6px #ef444460}
+.dt.g2{background:#6b7280}
+.bd{font-size:12px;color:#9ca3af;line-height:1.7}
+.ll{color:#6b7280;font-size:11px}
+.ac{display:flex;gap:8px;margin-top:12px}
+.ac select{flex:1;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;padding:6px 8px;font-size:12px;outline:none}
+.ac select:focus{border-color:#818cf8}
+.btn{background:#818cf8;border:none;color:#fff;padding:6px 14px;border-radius:8px;font-size:12px;cursor:pointer;font-weight:500}
 .btn:hover{background:#6d79e8}
-.btn.d{background:#ef4444}
-.btn.d:hover{background:#dc2626}
+.btn.d{background:#ef4444}.btn.d:hover{background:#dc2626}
 .btn:disabled{opacity:.4;cursor:not-allowed}
 .i{display:flex;justify-content:space-between;padding:2px 0}
+.section{margin:12px 16px}
+.ftr{display:flex;gap:10px;margin:8px 16px;flex-wrap:wrap;align-items:center}
+.ftr select{background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;padding:6px 10px;font-size:12px;outline:none}
+.ftr select:focus{border-color:#818cf8}
+.ftr .btn{padding:6px 12px;font-size:12px}
+.tbl{width:100%;border-collapse:collapse;font-size:12px}
+.tbl th{text-align:left;padding:8px 10px;color:#6b7280;font-weight:500;border-bottom:1px solid rgba(255,255,255,0.06);white-space:nowrap;position:sticky;top:0;background:#0f0f13;z-index:1}
+.tbl td{padding:7px 10px;border-bottom:1px solid rgba(255,255,255,0.03);vertical-align:middle}
+.tbl tr:hover{background:rgba(255,255,255,0.02)}
+.sta{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px}
+.sta.ok{background:#22c55e15;color:#22c55e}
+.sta.no{background:#ef444415;color:#ef4444}
+.sta.na{background:#6b728015;color:#6b7280}
+.act-cell{display:flex;gap:4px;flex-wrap:wrap}
+.act-cell .btn{font-size:11px;padding:3px 8px}
+.tp{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px}
+.tp.r{background:#22c55e15;color:#22c55e}
+.tp.h{background:#f59e0b15;color:#f59e0b}
+.tp.m{background:#818cf815;color:#818cf8}
+.tp.u{background:#6b728015;color:#6b7280}
+.ow{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.modal{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:100;align-items:center;justify-content:center}
+.modal.show{display:flex}
+.modal-c{background:#1a1a24;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:24px;min-width:280px;max-width:400px}
+.modal-c h3{margin-bottom:12px;font-size:15px}
+.modal-c select{width:100%;margin:8px 0;padding:8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:13px}
+.modal-c .btns{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
 </style>
 </head>
 <body>
-<div class="header">
+<div class="hd">
   <h1>AimiliVPN</h1>
-  <span class="badge">6通道</span>
-  <span id="node_count">节点: 加载中...</span>
+  <span class="bdg">6通道</span>
+  <span class="nc" id="nc">节点: 加载中...</span>
 </div>
 <div class="grid" id="grid"></div>
+
+<div class="section" style="margin-top:0">
+  <div class="ftr">
+    <select id="f_status"><option value="">全部节点</option><option value="available">可用节点</option><option value="failed">失效节点</option></select>
+    <select id="f_country"><option value="">所有国家</option></select>
+    <select id="f_type"><option value="">所有IP类型</option><option value="residential">住宅IP</option><option value="hosting">机房IP</option></select>
+    <button class="btn" onclick="refreshNodes()">刷新</button>
+    <span id="rc" style="color:#6b7280;font-size:12px;margin-left:auto"></span>
+  </div>
+  <div style="overflow-x:auto">
+  <table class="tbl" id="tbl"><thead><tr>
+    <th>状态</th><th>IP : 端口</th><th>物理位置</th><th>运营主体 / ISP</th><th>IP类型</th><th>操作</th>
+  </tr></thead><tbody id="tb"></tbody></table>
+  </div>
+</div>
+
+<div class="modal" id="modal"><div class="modal-c">
+  <h3>分配到通道</h3>
+  <p style="font-size:12px;color:#9ca3af;margin-bottom:8px" id="m_node_info"></p>
+  <select id="m_ch"></select>
+  <div class="btns">
+    <button class="btn" onclick="switchNode()">确认切换</button>
+    <button class="btn d" onclick="closeModal()">取消</button>
+  </div>
+</div></div>
+
 <script>
-const CH={channels_json};
-function r(d){
-  const g=document.getElementById('grid');
-  let h='';
-  for(let i=0;i<CH.length;i++){
-    const c=d.channels[i];
-    const cls=c.state==='connected'?'card ok':c.state==='connecting'?'card busy':c.state==='error'?'card fail':'card';
-    const dot=c.state==='connected'?'g':c.state==='connecting'?'y':c.state==='error'?'r':'g2';
-    const st={connected:'已连接',connecting:'连接中',disconnected:'未连接',error:'错误'}[c.state]||c.state;
-    h+='<div class="'+cls+'"><div class="flex"><div class="ct"><span class="cn">CH'+c.index+'</span><span class="dot '+dot+'"></span>'+st+'</div><span style="font-size:11px;color:#6b7280">'+c.tun+'</span></div><div class="body">';
-    h+='<div class="i"><span class="l">出站IP</span><span>'+ (c.node_ip||'-') +'</span></div>';
-    h+='<div class="i"><span class="l">国家</span><span>'+ (c.node_country||'-') +'</span></div>';
-    h+='<div class="i"><span class="l">延迟</span><span>'+ (c.node_latency>0?c.node_latency+'ms':'-') +'</span></div>';
-    h+='<div class="i"><span class="l">代理端口</span><span>'+c.proxy_port+'</span></div>';
-    h+='<div class="i"><span class="l">节点</span><span style="font-size:11px;color:#6b7280;max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+ (c.node_name||'-') +'</span></div>';
-    if(c.error) h+='<div class="i"><span class="l">错误</span><span style="color:#ef4444">'+c.error+'</span></div>';
-    h+='</div><div class="act"><select id="c_'+c.index+'"'+(c.state==='connecting'?' disabled':'')+'>';
+var CH=[]; var CUR_NODE=null;
+function render(d){
+  CH=d.channels; var g=document.getElementById('grid'),h='';
+  for(var i=0;i<CH.length;i++){
+    var c=CH[i];
+    var cls=c.state==='connected'?'card on':c.state==='connecting'?'card bz':c.state==='error'?'card fail':'card';
+    var dt=c.state==='connected'?'g':c.state==='connecting'?'y':c.state==='error'?'r':'g2';
+    var st={connected:'已连接',connecting:'连接中',disconnected:'未连接',error:'错误'}[c.state]||c.state;
+    var it=c.node_ip_type;
+    var ipc=c.node_ip_type==='residential'?'tp r':c.node_ip_type==='hosting'?'tp h':c.node_ip_type==='mobile'?'tp m':'tp u';
+    h+='<div class="'+cls+'"><div class="chf"><div class="ct"><span class="cn">CH'+c.index+'</span><span class="dt '+dt+'"></span>'+st+'</div><span style="font-size:10px;color:#6b7280">'+c.tun+'</span></div>';
+    h+='<div class="bd"><div class="i"><span class="ll">出口IP</span><span>'+ (c.node_ip||'-') +'</span></div>';
+    h+='<div class="i"><span class="ll">国家</span><span>'+ (c.node_country||'-') +'</span></div>';
+    h+='<div class="i"><span class="ll">位置</span><span style="max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+ (c.node_location||'-') +'</span></div>';
+    h+='<div class="i"><span class="ll">运营主体</span><span class="ow" title="'+c.node_owner+'">'+ (c.node_owner||'-') +'</span></div>';
+    h+='<div class="i"><span class="ll">IP类型</span><span'+(ipc?' class="'+ipc+'"':'')+'>'+ (it||'-') +'</span></div>';
+    h+='<div class="i"><span class="ll">延迟</span><span>'+ (c.node_latency>0?c.node_latency+'ms':'-') +'</span></div>';
+    h+='<div class="i"><span class="ll">代理</span><span>:'+c.proxy_port+'</span></div>';
+    if(c.error) h+='<div class="i"><span class="ll">错误</span><span style="color:#ef4444">'+c.error+'</span></div>';
+    h+='</div><div class="ac"><select id="cs_'+c.index+'"'+(c.state==='connecting'?' disabled':'')+'>';
     h+='<option value="">自动选择</option>';
-    for(const co of (d.countries||[])) h+='<option value="'+co+'"'+(c.force_country===co?' selected':'')+'>'+co+'</option>';
+    if(d.countries) for(var j=0;j<d.countries.length;j++){
+      var co=d.countries[j]; h+='<option value="'+co+'"'+(c.force_country===co?' selected':'')+'>'+co+'</option>';
+    }
     h+='</select>';
     if(c.state==='connected') h+='<button class="btn d" onclick="dc('+c.index+')">断开</button>';
-    else h+='<button class="btn" onclick="con('+c.index+')"'+(c.state==='connecting'?' disabled':'')+'>连接</button>';
+    else h+='<button class="btn" onclick="connectAuto('+c.index+')"'+(c.state==='connecting'?' disabled':'')+'>连接</button>';
     h+='</div></div>';
   }
-  g.innerHTML=h;
-  document.getElementById('node_count').textContent='节点: '+(d.node_count||0);
+  g.innerHTML=h; document.getElementById('nc').textContent='节点: '+(d.node_count||0);
 }
-async function rf(){try{const r=await fetch('/api/status');const d=await r.json();r(d)}catch(e){}}
-async function con(i){const s=document.getElementById('c_'+i);await fetch('/api/channel/'+i+'/connect?country='+encodeURIComponent(s?s.value:''),{method:'POST'});setTimeout(rf,500)}
+async function rf(){try{var r=await fetch('/api/status');var d=await r.json();render(d)}catch(e){}}
+async function connectAuto(i){var s=document.getElementById('cs_'+i);var c=s?s.value:'';await fetch('/api/channel/'+i+'/connect?country='+encodeURIComponent(c),{method:'POST'});setTimeout(rf,500)}
 async function dc(i){await fetch('/api/channel/'+i+'/disconnect',{method:'POST'});rf()}
 rf();setInterval(rf,3000);
+
+function openSwitch(node_id,node_ip,node_country){
+  CUR_NODE=node_id;
+  document.getElementById('m_node_info').textContent=node_ip+' ('+node_country+')';
+  var sel=document.getElementById('m_ch'); sel.innerHTML='';
+  for(var i=0;i<CH.length;i++){
+    var opt=document.createElement('option'); opt.value=i;
+    opt.textContent='CH'+i+' ('+CH[i].tun+')'+(CH[i].state==='connected'?' - '+CH[i].node_ip:' - 未连接');
+    sel.appendChild(opt);
+  }
+  document.getElementById('modal').classList.add('show');
+}
+async function switchNode(){
+  var idx=document.getElementById('m_ch').value;
+  await fetch('/api/channel/'+idx+'/connect?node_id='+encodeURIComponent(CUR_NODE),{method:'POST'});
+  closeModal(); setTimeout(rf,500);
+}
+function closeModal(){document.getElementById('modal').classList.remove('show');CUR_NODE=null}
+
+async function refreshNodes(){
+  var st=document.getElementById('f_status').value;
+  var ct=document.getElementById('f_country').value;
+  var tp=document.getElementById('f_type').value;
+  var q='?filter='+st+'&country='+encodeURIComponent(ct)+'&ip_type='+encodeURIComponent(tp);
+  try{
+    var r=await fetch('/api/nodes'+q); var d=await r.json();
+    var tb=document.getElementById('tb'),h='';
+    for(var i=0;i<d.nodes.length;i++){
+      var n=d.nodes[i];
+      var av=n.available?'sta ok':'sta no';
+      var avt=n.available?'可用':'不可用';
+      var ipc=n.ip_type==='residential'?'tp r':n.ip_type==='hosting'?'tp h':n.ip_type==='mobile'?'tp m':'tp u';
+      h+='<tr><td><span class="sta '+av+'">'+avt+'</span></td>';
+      h+='<td>'+n.ip+':'+n.port+'</td>';
+      h+='<td class="ow" title="'+n.location+'">'+(n.location||'-')+'</td>';
+      h+='<td class="ow" title="'+n.owner+'">'+(n.owner||'-')+'</td>';
+      h+='<td>'+(n.ip_type?'<span class="'+ipc+'">'+(n.ip_type==='residential'?'住宅':n.ip_type==='hosting'?'机房':n.ip_type)+'</span>':'-')+'</td>';
+      h+='<td class="act-cell">';
+      if(n.available) h+='<button class="btn" onclick="openSwitch(\''+n.id+'\',\''+n.ip+':'+n.port+'\',\''+(n.country_long||'')+'\')">切换</button>';
+      else h+='<button class="btn" disabled>切换</button>';
+      h+='</td></tr>';
+    }
+    tb.innerHTML=h; document.getElementById('rc').textContent='共 '+d.total+' 个节点 (显示 '+d.nodes.length+')';
+  }catch(e){}
+}
+async function loadCountries(){
+  try{
+    var r=await fetch('/api/status'); var d=await r.json();
+    var sel=document.getElementById('f_country');
+    if(d.countries) for(var i=0;i<d.countries.length;i++){var o=document.createElement('option');o.value=d.countries[i];o.textContent=d.countries[i];sel.appendChild(o)}
+  }catch(e){}
+}
+loadCountries(); refreshNodes();
 </script>
 </body>
 </html>"""
@@ -428,110 +442,118 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self, data: Any, status: int = HTTPStatus.OK):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self.send_header("Content-Type","application/json; charset=utf-8")
+        self.send_header("Content-Length",str(len(body)))
+        self.end_headers(); self.wfile.write(body)
 
-    def log_message(self, fmt, *args):
-        pass
+    def log_message(self, fmt, *args): pass
 
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path in ("/", "/index.html"):
-            html = CHANNELS_HTML.replace("{channels_json}", json.dumps([c.to_dict() for c in channels]))
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        params = urllib.parse.parse_qs(parsed.query)
+
+        if path in ("/","/index.html"):
+            html = PAGE_HTML.replace("{channels_json}",json.dumps([c.to_dict() for c in channels]))
             self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html.encode())))
-            self.end_headers()
-            self.wfile.write(html.encode())
+            self.send_header("Content-Type","text/html; charset=utf-8")
+            self.send_header("Content-Length",str(len(html.encode())))
+            self.end_headers(); self.wfile.write(html.encode())
         elif path == "/api/status":
             with nodes_cache_lock:
-                countries = sorted(set(n.get("country_long", "") for n in nodes_cache if n.get("country_long")))
+                countries = sorted(set(n.get("country_long","") for n in nodes_cache if n.get("country_long")))
                 node_count = len(nodes_cache)
-            self.send_json({
-                "channels": [c.to_dict() for c in channels],
-                "countries": countries,
-                "node_count": node_count,
-            })
+            self.send_json({"channels":[c.to_dict() for c in channels],"countries":countries,"node_count":node_count})
         elif path == "/api/nodes":
+            filter_type = params.get("filter",[""])[0]
+            country = params.get("country",[""])[0]
+            ip_type = params.get("ip_type",[""])[0]
             with nodes_cache_lock:
-                safe = [{k: v for k, v in n.items() if k != "config_text"} for n in nodes_cache]
-            self.send_json({"nodes": safe})
+                nodes = list(nodes_cache)
+            result = []
+            for n in nodes:
+                ip = n.get("ip","")
+                port = n.get("port","443")
+                available = n.get("ping",999) > 0 and n.get("ping",999) < 999  # rough availability
+                # Actually check: the node has config_text means it has a config
+                available = bool(n.get("config_text"))
+                n_country = n.get("country_long","")
+                n_ip_type = n.get("ip_type","")
+                if country and country.lower() not in n_country.lower(): continue
+                if ip_type and n_ip_type != ip_type: continue
+                if filter_type == "available" and not available: continue
+                if filter_type == "failed" and available: continue
+                result.append({
+                    "id": n.get("id",""), "ip": ip, "port": port,
+                    "country_long": n_country, "available": available,
+                    "location": n.get("location",""), "owner": n.get("owner",""),
+                    "ip_type": n_ip_type, "asn": n.get("asn",""),
+                })
+            self.send_json({"nodes":result[:200], "total":len(result)})
         else:
-            self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
+            self.send_json({"error":"not found"}, HTTPStatus.NOT_FOUND)
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
         m = re.match(r"^/api/channel/(\d+)/(connect|disconnect)$", path)
-        if not m:
-            self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
-            return
-        idx = int(m.group(1))
-        action = m.group(2)
-        if idx < 0 or idx >= NUM_CHANNELS:
-            self.send_json({"error": "channel out of range"}, HTTPStatus.BAD_REQUEST)
-            return
+        if not m: self.send_json({"error":"not found"}, HTTPStatus.NOT_FOUND); return
+        idx = int(m.group(1)); action = m.group(2)
+        if idx < 0 or idx >= NUM_CHANNELS: self.send_json({"error":"out of range"}, HTTPStatus.BAD_REQUEST); return
         ch = channels[idx]
-        if action == "connect":
-            country = params.get("country", [""])[0]
-            ch.force_country = country
-            node = get_best_node_for_country(country)
-            if not node:
-                self.send_json({"error": "No nodes available"}, HTTPStatus.SERVICE_UNAVAILABLE)
-                return
-            ok = connect_channel(ch, node)
-            self.send_json({"ok": ok, "channel": ch.to_dict()})
-        else:  # disconnect
+        if action == "disconnect":
             disconnect_channel(ch)
             ch.force_country = ""
-            self.send_json({"ok": True, "channel": ch.to_dict()})
+            self.send_json({"ok":True,"channel":ch.to_dict()})
+        else:
+            node_id = params.get("node_id",[None])[0]
+            country = params.get("country",[""])[0]
+            if node_id:
+                node = get_node_by_id(node_id)
+                if not node: self.send_json({"error":"node not found"}, HTTPStatus.NOT_FOUND); return
+            else:
+                node = get_best_node_for_country(country)
+                if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
+                if country: ch.force_country = country
+            ok = connect_channel(ch, node)
+            self.send_json({"ok":ok,"channel":ch.to_dict()})
 
 # === Main ===
 def main():
-    log("=== AimiliVPN 6-Channel Manager ===")
-
-    try:
-        subprocess.run(["pkill", "-f", "openvpn"], timeout=5, capture_output=True)
-    except:
-        pass
-
+    log("=== AimiliVPN 6-Channel Manager + Node UI ===")
+    try: subprocess.run(["pkill","-f","openvpn"], timeout=5, capture_output=True)
+    except: pass
     ch_cfg = read_json(CHANNELS_FILE)
     for ch in channels:
-        c = ch_cfg.get(str(ch.index), {})
-        ch.force_country = c.get("force_country", "")
-
+        c = ch_cfg.get(str(ch.index),{})
+        ch.force_country = c.get("force_country","")
     start_all_proxies()
-    log("[init] All 6 proxies started")
-
+    log("[init] 6 proxies started")
     threading.Thread(target=collector_loop, daemon=True).start()
     log("[init] Collector started")
-
     time.sleep(2)
+    # Initial fetch
     nodes = fetch_nodes()
-    with nodes_cache_lock:
-        nodes_cache = nodes
-
+    if nodes:
+        try: vpn_utils.enrich_ip_info(nodes)
+        except: pass
+        with nodes_cache_lock: nodes_cache = nodes
+        stripped = [{k:v for k,v in n.items() if k!="config_text"} for n in nodes]
+        write_json(NODES_FILE, stripped)
     for ch in channels:
         if ch.force_country:
             node = get_best_node_for_country(ch.force_country)
             if node:
-                threading.Thread(target=connect_channel, args=(ch, node), daemon=True).start()
+                threading.Thread(target=connect_channel, args=(ch,node), daemon=True).start()
                 time.sleep(2)
-
     class DualStackServer(ThreadingHTTPServer):
         allow_reuse_address = True
-
-    log(f"[UI] Dashboard on http://{UI_HOST}:{UI_PORT}/")
-
+    log(f"[UI] http://{UI_HOST}:{UI_PORT}/")
     try:
-        server = DualStackServer((UI_HOST, UI_PORT), Handler)
-        server.serve_forever()
+        server = DualStackServer((UI_HOST, UI_PORT), Handler); server.serve_forever()
     except Exception:
-        server = DualStackServer(("0.0.0.0", UI_PORT), Handler)
-        server.serve_forever()
+        server = DualStackServer(("0.0.0.0", UI_PORT), Handler); server.serve_forever()
 
 if __name__ == "__main__":
     main()
