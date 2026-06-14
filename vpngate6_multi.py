@@ -12,6 +12,33 @@ from pathlib import Path
 from typing import Any
 import vpn_utils
 
+# === Auth ===
+auth_token_store: dict[str, float] = {}
+
+def load_auth_config() -> dict:
+    return read_json(DATA_DIR / "ui_auth.json") or {"username":"admin","password":"admin"}
+
+def check_auth_token(headers) -> bool:
+    cookie = headers.get("Cookie","") or ""
+    for part in cookie.split(";"):
+        part=part.strip()
+        if part.startswith("token="):
+            tok=part[6:]
+            entry=auth_token_store.get(tok)
+            if entry and time.time()-entry<86400:
+                return True
+            elif entry:
+                del auth_token_store[tok]
+    return False
+
+def generate_token() -> str:
+    tok=secrets.token_hex(32)
+    auth_token_store[tok]=time.time()
+    return tok
+
+import hashlib, secrets
+LOGIN_HTML_CACHE = ""
+
 NUM_CHANNELS = 6
 PROXY_BASE_PORT = 7928
 UI_PORT = 8787
@@ -453,6 +480,22 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
 
+        if not check_auth_token(self.headers):
+            if path == "/api/login":
+                self.send_json({"ok":False})
+                return
+            global LOGIN_HTML_CACHE
+            if not LOGIN_HTML_CACHE:
+                try:
+                    LOGIN_HTML_CACHE = open(str(DATA_DIR / "login.html")).read()
+                except:
+                    LOGIN_HTML_CACHE = "<html><body><h2>Login page not found</h2></body></html>"
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type","text/html; charset=utf-8")
+            self.send_header("Content-Length",str(len(LOGIN_HTML_CACHE.encode())))
+            self.end_headers(); self.wfile.write(LOGIN_HTML_CACHE.encode())
+            return
+
         if path in ("/","/index.html"):
             html = PAGE_HTML.replace("{channels_json}",json.dumps([c.to_dict() for c in channels]))
             self.send_response(HTTPStatus.OK)
@@ -497,6 +540,30 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         params = urllib.parse.parse_qs(parsed.query)
+
+        # Login POST endpoint
+        if path == "/api/login":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
+                p = urllib.parse.parse_qs(body)
+                user = (p.get("username", [""])[0] or "").strip()
+                pwd = (p.get("password", [""])[0] or "").strip()
+                cfg = load_auth_config()
+                if user == cfg.get("username", "admin") and pwd == cfg.get("password", "admin"):
+                    tok = generate_token()
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Set-Cookie", f"token={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400")
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", "8")
+                    self.end_headers()
+                    self.wfile.write(b'{"ok":true}')
+                else:
+                    self.send_json({"ok": False}, HTTPStatus.UNAUTHORIZED)
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
+            return
+
         m = re.match(r"^/api/channel/(\d+)/(connect|disconnect)$", path)
         if not m: self.send_json({"error":"not found"}, HTTPStatus.NOT_FOUND); return
         idx = int(m.group(1)); action = m.group(2)
