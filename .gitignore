@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+vpngate_data/
+.DS_Store
