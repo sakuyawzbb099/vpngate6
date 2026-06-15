@@ -395,7 +395,13 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 
 <script>
 var CH=[]; var CUR_NODE=null;
+var _saved={}; // Save dropdown state across renders
 function render(d){
+  // Preserve current dropdown selections
+  for(var i=0;i<6;i++){
+    var el=document.getElementById('cs_'+i);if(el)_saved['cs_'+i]=el.value;
+    var el2=document.getElementById('ipt_'+i);if(el2)_saved['ipt_'+i]=el2.value;
+  }
   CH=d.channels; var g=document.getElementById('grid'),h='';
   for(var i=0;i<CH.length;i++){
     var c=CH[i];
@@ -416,13 +422,16 @@ function render(d){
     h+='</div><div class="ac"><select id="cs_'+c.index+'"'+(c.state==='connecting'?' disabled':'')+'>';
     h+='<option value="">自动选择</option>';
     if(d.countries) for(var j=0;j<d.countries.length;j++){
-      var co=d.countries[j]; h+='<option value="'+co+'"'+(c.force_country===co?' selected':'')+'>'+co+'</option>';
+      var co=d.countries[j];
+      var sel=(_saved['cs_'+c.index]===co)||(c.force_country===co)?' selected':'';
+      h+='<option value="'+co+'"'+sel+'>'+co+'</option>';
     }
     h+='</select>';
+    var savedIpt=_saved['ipt_'+c.index]||'';
     h+='<select id="ipt_'+c.index+'"'+(c.state==='connecting'?' disabled':'')+'>';
-    h+='<option value="">全部IP</option><option value="residential"'+(c.force_ip_type==='residential'?' selected':'')+'>住宅</option>';
-    h+='<option value="hosting"'+(c.force_ip_type==='hosting'?' selected':'')+'>机房</option>';
-    h+='<option value="mobile"'+(c.force_ip_type==='mobile'?' selected':'')+'>移动</option></select>';
+    h+='<option value="">全部IP</option><option value="residential"'+(savedIpt==='residential'||c.force_ip_type==='residential'?' selected':'')+'>住宅</option>';
+    h+='<option value="hosting"'+(savedIpt==='hosting'||c.force_ip_type==='hosting'?' selected':'')+'>机房</option>';
+    h+='<option value="mobile"'+(savedIpt==='mobile'||c.force_ip_type==='mobile'?' selected':'')+'>移动</option></select>';
     if(c.state==='connected') h+='<button class="btn d" onclick="dc('+c.index+')">断开</button>';
     else h+='<button class="btn" onclick="connectAuto('+c.index+')"'+(c.state==='connecting'?' disabled':'')+'>连接</button>';
     h+='</div></div>';
