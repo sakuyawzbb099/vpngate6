@@ -725,28 +725,37 @@ class Handler(BaseHTTPRequestHandler):
 
 # === Main ===
 def channel_watchdog():
-    """Watchdog: detect dead connections and auto-reconnect if channel has criteria set."""
+    """Watchdog: detect dead connections and auto-reconnect with jitter."""
     while True:
-        time.sleep(20)
+        time.sleep(10)
         for ch in channels:
             try:
                 with ch.lock:
                     if ch.state == "connecting":
-                        continue  # Still trying to connect, skip
+                        continue
                     if ch.state == "connected":
-                        # Check if OpenVPN process died
-                        if ch.process is None or ch.process.poll() is not None:
+                        # Quick process health check
+                        proc_alive = True
+                        try:
+                            if ch.process is None or ch.process.poll() is not None:
+                                proc_alive = False
+                        except:
+                            proc_alive = False
+                        if not proc_alive:
                             ch.state = "disconnected"
                             ch.process = None
                             log(f"[WD CH{ch.index}] Connection lost")
                         else:
                             continue
-                    # Auto-reconnect if criteria are set
                     if ch.state in ("disconnected", "error") and ch.force_country:
                         node = get_best_node_for_country(ch.force_country, ch.force_ip_type)
                         if node:
                             log(f"[WD CH{ch.index}] Reconnect {ch.force_country} {ch.force_ip_type}")
-                            threading.Thread(target=connect_channel, args=(ch, node), daemon=True).start()
+                            # Stagger reconnects so 6 channels don't fight
+                            delay = ch.index * 3
+                            threading.Thread(target=lambda ch=ch, node=node, d=delay: (
+                                time.sleep(d), connect_channel(ch, node)
+                            ), daemon=True).start()
                         else:
                             log(f"[WD CH{ch.index}] No node for {ch.force_country} {ch.force_ip_type}")
             except Exception as e:
