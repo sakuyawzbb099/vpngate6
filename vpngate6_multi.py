@@ -780,8 +780,27 @@ def channel_watchdog():
                             ch.state = "disconnected"
                             ch.process = None
                             log(f"[WD CH{ch.index}] Connection lost")
+                            # Fall through to reconnect
                         else:
-                            continue
+                            # Tunnel health check every 30s via ping
+                            tun_ok = True
+                            try:
+                                r = subprocess.run(["ping","-I",ch.tun,"-c","1","-W","2","8.8.8.8"],
+                                                 capture_output=True, timeout=4)
+                                if r.returncode != 0:
+                                    tun_ok = False
+                            except:
+                                tun_ok = False
+                            if not tun_ok:
+                                log(f"[WD CH{ch.index}] Tunnel dead, reconnecting...")
+                                stop_process(ch.process)
+                                ch.process = None
+                                cleanup_policy_routing(100 + ch.index)
+                                ch.state = "disconnected"
+                                ch.last_node_data = None
+                                # Fall through to reconnect
+                            else:
+                                continue
                     if ch.state in ("disconnected", "error") and ch.force_country:
                         # Try last known node first (same IP)
                         node = None
