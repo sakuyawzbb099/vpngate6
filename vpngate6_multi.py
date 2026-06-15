@@ -109,6 +109,15 @@ def read_json(path: Path) -> Any:
 def write_json(path: Path, data: Any):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+def save_channels():
+    data = {}
+    for ch in channels:
+        data[str(ch.index)] = {
+            "force_country": ch.force_country,
+            "force_ip_type": ch.force_ip_type,
+        }
+    write_json(CHANNELS_FILE, data)
+
 def stop_process(proc: subprocess.Popen[str] | None):
     if proc is None: return
     try: proc.terminate(); proc.wait(timeout=3)
@@ -736,6 +745,7 @@ class Handler(BaseHTTPRequestHandler):
             disconnect_channel(ch)
             ch.force_country = ""
             ch.force_ip_type = ""
+            save_channels()
             self.send_json({"ok":True,"channel":ch.to_dict()})
         else:
             node_id = params.get("node_id",[None])[0]
@@ -749,12 +759,14 @@ class Handler(BaseHTTPRequestHandler):
                 if node_country: ch.force_country = node_country
                 node_iptype = node.get("ip_type","")
                 if node_iptype: ch.force_ip_type = node_iptype
+                save_channels()
             else:
                 used_ips = set(c.node_ip for c in channels if c.state == "connected" and c.node_ip)
                 node = get_best_node_for_country(country, ip_type, used_ips)
                 if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
                 if country: ch.force_country = country
                 ch.force_ip_type = ip_type
+                save_channels()
             ok = connect_channel(ch, node)
             self.send_json({"ok":ok,"channel":ch.to_dict()})
 
