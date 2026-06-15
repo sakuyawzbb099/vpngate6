@@ -254,6 +254,9 @@ def manual_fetch() -> dict:
                 result["dup"] = len(new_ids & _last_node_ids)
             else:
                 result["new"] = len(new_ids)
+            # Mark each node as new or duplicate
+            for n in nodes:
+                n["is_new"] = n.get("id","") not in _last_node_ids if _last_node_ids else True
             _last_node_ids = new_ids
             with nodes_cache_lock:
                 global nodes_cache
@@ -275,6 +278,8 @@ def collector_loop():
                 try: vpn_utils.enrich_ip_info(nodes)
                 except Exception as e: log(f"[enrich] Error: {e}")
                 new_ids = set(n.get("id","") for n in nodes if n.get("id"))
+                for n in nodes:
+                    n["is_new"] = True  # Auto-fetch always marks all as baseline
                 if new_ids: _last_node_ids = new_ids
                 with nodes_cache_lock: nodes_cache = nodes
                 stripped = [{k:v for k,v in n.items() if k != "config_text"} for n in nodes]
@@ -595,6 +600,7 @@ class Handler(BaseHTTPRequestHandler):
                     "country_long": n_country, "available": available,
                     "location": n.get("location",""), "owner": n.get("owner",""),
                     "ip_type": n_ip_type, "asn": n.get("asn",""),
+                    "is_new": n.get("is_new", False),
                 })
             self.send_json({"nodes":result[:200], "total":len(result)})
         else:
