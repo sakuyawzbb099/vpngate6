@@ -533,10 +533,11 @@ class Handler(BaseHTTPRequestHandler):
                     LOGIN_HTML_CACHE = open(str(DATA_DIR / "login.html")).read()
                 except:
                     LOGIN_HTML_CACHE = "<html><body><h2>Login page not found</h2></body></html>"
+            body = LOGIN_HTML_CACHE.replace("${error_display}", "block" if params.get("error") else "none").encode()
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type","text/html; charset=utf-8")
-            self.send_header("Content-Length",str(len(LOGIN_HTML_CACHE.encode())))
-            self.end_headers(); self.wfile.write(LOGIN_HTML_CACHE.replace("${error_display}", "block" if params.get("error") else "none").encode())
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers(); self.wfile.write(body)
             return
 
         if path in ("/","/index.html"):
