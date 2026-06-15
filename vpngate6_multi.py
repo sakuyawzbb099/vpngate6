@@ -710,6 +710,11 @@ class Handler(BaseHTTPRequestHandler):
             if node_id:
                 node = get_node_by_id(node_id)
                 if not node: self.send_json({"error":"node not found"}, HTTPStatus.NOT_FOUND); return
+                # Also set force_country so watchdog can auto-reconnect
+                node_country = node.get("country_long","")
+                if node_country: ch.force_country = node_country
+                node_iptype = node.get("ip_type","")
+                if node_iptype: ch.force_ip_type = node_iptype
             else:
                 node = get_best_node_for_country(country, ip_type)
                 if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
