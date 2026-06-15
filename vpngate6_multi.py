@@ -315,7 +315,8 @@ def collector_loop():
         time.sleep(FETCH_INTERVAL)
 
 # === Channel Manager ===
-def get_best_node_for_country(country: str, ip_type: str = "") -> dict | None:
+def get_best_node_for_country(country: str, ip_type: str = "", exclude_ips: set = None) -> dict | None:
+    if exclude_ips is None: exclude_ips = set()
     with nodes_cache_lock: candidates = list(nodes_cache)
     if not candidates: return None
     filtered = candidates
@@ -323,6 +324,13 @@ def get_best_node_for_country(country: str, ip_type: str = "") -> dict | None:
         filtered = [n for n in filtered if country.lower() in n.get("country_long","").lower()]
     if ip_type:
         filtered = [n for n in filtered if n.get("ip_type","") == ip_type]
+    if exclude_ips:
+        filtered = [n for n in filtered if n.get("ip","") not in exclude_ips]
+    if not filtered:
+        # If no nodes left after excluding IPs, try without exclusion
+        filtered = [n for n in candidates if country.lower() in n.get("country_long","").lower()]
+        if ip_type:
+            filtered = [n for n in filtered if n.get("ip_type","") == ip_type]
     if not filtered: return None
     pool = filtered[:min(30, len(filtered))]
     return random.choice(pool) if pool else None
@@ -742,7 +750,8 @@ class Handler(BaseHTTPRequestHandler):
                 node_iptype = node.get("ip_type","")
                 if node_iptype: ch.force_ip_type = node_iptype
             else:
-                node = get_best_node_for_country(country, ip_type)
+                used_ips = set(c.node_ip for c in channels if c.state == "connected" and c.node_ip)
+                node = get_best_node_for_country(country, ip_type, used_ips)
                 if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
                 if country: ch.force_country = country
                 ch.force_ip_type = ip_type
@@ -781,7 +790,8 @@ def channel_watchdog():
                             node = last
                             log(f"[WD CH{ch.index}] Retry same node {last.get(chr(105)+chr(112),chr(34)+chr(34))}")
                         else:
-                            node = get_best_node_for_country(ch.force_country, ch.force_ip_type)
+                            used_ips = set(c.node_ip for c in channels if c.state == "connected" and c.node_ip and c.index != ch.index)
+                            node = get_best_node_for_country(ch.force_country, ch.force_ip_type, used_ips)
                         if node:
                             log(f"[WD CH{ch.index}] Reconnect {ch.force_country} {ch.force_ip_type}")
                             # Stagger reconnects so 6 channels don't fight
@@ -820,7 +830,8 @@ def main():
         write_json(NODES_FILE, stripped)
     for ch in channels:
         if ch.force_country:
-            node = get_best_node_for_country(ch.force_country)
+            used_ips = set(c.node_ip for c in channels if c.state == "connected" and c.node_ip)
+            node = get_best_node_for_country(ch.force_country, ch.force_ip_type, used_ips)
             if node:
                 threading.Thread(target=connect_channel, args=(ch,node), daemon=True).start()
                 time.sleep(2)
