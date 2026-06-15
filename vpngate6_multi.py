@@ -96,6 +96,7 @@ class Channel:
 channels: list[Channel] = [Channel(i) for i in range(NUM_CHANNELS)]
 nodes_cache: list[dict[str, Any]] = []
 nodes_cache_lock = threading.Lock()
+_last_node_ids: set[str] = set()  # Track previous fetch for duplicate detection
 
 def log(msg: str):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -237,36 +238,46 @@ def fetch_nodes() -> list[dict[str, Any]]:
     nodes = nodes[:300]
     return nodes
 
-def manual_fetch():
-    """Manually trigger a node fetch."""
+def manual_fetch() -> dict:
+    """Manually trigger a node fetch. Returns {new, dup, total}."""
+    result = {"new": 0, "dup": 0, "total": 0}
+    global _last_node_ids
     try:
         nodes = fetch_nodes()
         if nodes:
             try: vpn_utils.enrich_ip_info(nodes)
             except: pass
+            new_ids = set(n.get("id","") for n in nodes if n.get("id"))
+            result["total"] = len(nodes)
+            if _last_node_ids:
+                result["new"] = len(new_ids - _last_node_ids)
+                result["dup"] = len(new_ids & _last_node_ids)
+            else:
+                result["new"] = len(new_ids)
+            _last_node_ids = new_ids
             with nodes_cache_lock:
                 global nodes_cache
                 nodes_cache = nodes
             stripped = [{k:v for k,v in n.items() if k!="config_text"} for n in nodes]
             write_json(NODES_FILE, stripped)
-            log(f"[manual_fetch] {len(nodes)} nodes fetched")
+            log(f"[manual_fetch] {len(nodes)} nodes (new:{result['new']} dup:{result['dup']})")
     except Exception as e:
         log(f"[manual_fetch] Error: {e}")
+    return result
 
 
 def collector_loop():
-    global nodes_cache
+    global nodes_cache, _last_node_ids
     while True:
         try:
             nodes = fetch_nodes()
             if nodes:
                 try: vpn_utils.enrich_ip_info(nodes)
                 except Exception as e: log(f"[enrich] Error: {e}")
+                new_ids = set(n.get("id","") for n in nodes if n.get("id"))
+                if new_ids: _last_node_ids = new_ids
                 with nodes_cache_lock: nodes_cache = nodes
-                stripped = []
-                for n in nodes:
-                    s = {k:v for k,v in n.items() if k != "config_text"}
-                    stripped.append(s)
+                stripped = [{k:v for k,v in n.items() if k != "config_text"} for n in nodes]
                 write_json(NODES_FILE, stripped)
                 log(f"[fetch] {len(nodes)} nodes, enriched")
         except Exception as e: log(f"[collector] Error: {e}")
@@ -446,8 +457,17 @@ async function connectAuto(i){
   setTimeout(rf,500)}
 async function fetchNodes(){
   document.getElementById('rc').textContent='获取中...';
-  await fetch('/api/fetch_nodes',{method:'POST'});
-  setTimeout(refreshNodes,5000);}
+  try{
+    var r=await fetch('/api/fetch_nodes',{method:'POST'});
+    var d=await r.json();
+    if(d.ok){
+      var msg='获取完成: '+d.total+' 节点';
+      if(d.new>0) msg+=', 新增 '+d.new;
+      if(d.dup>0) msg+=', 重复 '+d.dup;
+      document.getElementById('rc').textContent=msg;
+    }
+  }catch(e){}
+  setTimeout(refreshNodes,3000);}
 async function dc(i){await fetch('/api/channel/'+i+'/disconnect',{method:'POST'});rf()}
 rf();setInterval(rf,3000);
 
@@ -609,8 +629,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/fetch_nodes":
-            threading.Thread(target=manual_fetch, daemon=True).start()
-            self.send_json({"ok": True, "message": "Fetching nodes..."})
+            res = manual_fetch()
+            self.send_json({"ok": True, "new": res["new"], "dup": res["dup"], "total": res["total"]})
             return
 
         m = re.match(r"^/api/channel/(\d+)/(connect|disconnect)$", path)
