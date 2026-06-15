@@ -527,7 +527,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type","text/html; charset=utf-8")
             self.send_header("Content-Length",str(len(LOGIN_HTML_CACHE.encode())))
-            self.end_headers(); self.wfile.write(LOGIN_HTML_CACHE.encode())
+            self.end_headers(); self.wfile.write(LOGIN_HTML_CACHE.replace("${error_display}", "block" if params.get("error") else "none").encode())
             return
 
         if path in ("/","/index.html"):
@@ -586,14 +586,14 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = load_auth_config()
                 if user == cfg.get("username", "admin") and pwd == cfg.get("password", "admin"):
                     tok = generate_token()
-                    self.send_response(HTTPStatus.OK)
+                    self.send_response(HTTPStatus.FOUND)
                     self.send_header("Set-Cookie", f"token={tok}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400")
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", "8")
+                    self.send_header("Location", "/")
                     self.end_headers()
-                    self.wfile.write(b'{"ok":true}')
                 else:
-                    self.send_json({"ok": False}, HTTPStatus.UNAUTHORIZED)
+                    self.send_response(HTTPStatus.FOUND)
+                    self.send_header("Location", "/?error=1")
+                    self.end_headers()
             except Exception as e:
                 self.send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
             return
