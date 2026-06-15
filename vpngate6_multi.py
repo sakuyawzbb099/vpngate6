@@ -665,6 +665,34 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok":ok,"channel":ch.to_dict()})
 
 # === Main ===
+def channel_watchdog():
+    """Watchdog: detect dead connections and auto-reconnect if channel has criteria set."""
+    while True:
+        time.sleep(20)
+        for ch in channels:
+            try:
+                with ch.lock:
+                    if ch.state == "connecting":
+                        continue  # Still trying to connect, skip
+                    if ch.state == "connected":
+                        # Check if OpenVPN process died
+                        if ch.process is None or ch.process.poll() is not None:
+                            ch.state = "disconnected"
+                            ch.process = None
+                            log(f"[WD CH{ch.index}] Connection lost")
+                        else:
+                            continue
+                    # Auto-reconnect if criteria are set
+                    if ch.state in ("disconnected", "error") and ch.force_country:
+                        node = get_best_node_for_country(ch.force_country, ch.force_ip_type)
+                        if node:
+                            log(f"[WD CH{ch.index}] Reconnect {ch.force_country} {ch.force_ip_type}")
+                            threading.Thread(target=connect_channel, args=(ch, node), daemon=True).start()
+                        else:
+                            log(f"[WD CH{ch.index}] No node for {ch.force_country} {ch.force_ip_type}")
+            except Exception as e:
+                log(f"[WD CH{ch.index}] Error: {e}")
+
 def main():
     log("=== AimiliVPN 6-Channel Manager + Node UI ===")
     try: subprocess.run(["pkill","-f","openvpn"], timeout=5, capture_output=True)
@@ -678,6 +706,8 @@ def main():
     log("[init] 6 proxies started")
     threading.Thread(target=collector_loop, daemon=True).start()
     log("[init] Collector started")
+    threading.Thread(target=channel_watchdog, daemon=True).start()
+    log("[init] Watchdog started")
     time.sleep(2)
     # Initial fetch
     nodes = fetch_nodes()
