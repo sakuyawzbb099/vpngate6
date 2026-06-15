@@ -135,7 +135,9 @@ def setup_policy_routing(tun_dev: str, table: int):
 def openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
     cmd = ["openvpn","--config",config_file,"--dev",tun_dev,"--dev-type","tun",
            "--pull-filter","ignore","route-ipv6","--pull-filter","ignore","ifconfig-ipv6",
-           "--route-delay","2","--connect-retry-max","1","--connect-timeout","15",
+           "--pull-filter","ignore","inactive",
+           "--route-delay","2","--connect-retry-max","5","--connect-timeout","15",
+           "--keepalive","10","60",
            "--auth-user-pass",str(AUTH_FILE),"--auth-nocache","--verb","3",
            "--data-ciphers","AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
            "--route-nopull"]
