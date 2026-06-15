@@ -82,6 +82,7 @@ class Channel:
         self.process: subprocess.Popen[str] | None = None
         self.error = ""
         self.last_heartbeat = 0.0
+        self.last_node_data: dict | None = None  # Save last node for reconnect
         self.lock = threading.Lock()
 
     def to_dict(self) -> dict:
@@ -136,8 +137,10 @@ def openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
     cmd = ["openvpn","--config",config_file,"--dev",tun_dev,"--dev-type","tun",
            "--pull-filter","ignore","route-ipv6","--pull-filter","ignore","ifconfig-ipv6",
            "--pull-filter","ignore","inactive",
-           "--route-delay","2","--connect-retry-max","5","--connect-timeout","15",
+           "--route-delay","2","--connect-retry-max","0","--connect-timeout","15",
            "--keepalive","10","60",
+           "--reconnect-sleep-random","1","5",
+           "--resolv-retry","infinite",
            "--auth-user-pass",str(AUTH_FILE),"--auth-nocache","--verb","3",
            "--data-ciphers","AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305",
            "--route-nopull"]
@@ -177,7 +180,11 @@ def connect_channel(ch: Channel, node: dict) -> bool:
             ch.state = "error"; ch.error = "AUTH_FAILED"; stop_process(proc); return False
     if not ok:
         stop_process(proc); ch.state = "error"; ch.error = tail[-1][:200] if tail else "timeout"; return False
-    with ch.lock: ch.process = proc; ch.state = "connected"; ch.last_heartbeat = time.time()
+    with ch.lock:
+            ch.process = proc
+            ch.state = "connected"
+            ch.last_heartbeat = time.time()
+            ch.last_node_data = node  # Save for reconnection
     setup_policy_routing(ch.tun, 100 + ch.index)
     log(f"[CH{ch.index}] Connected! {ch.tun} :{ch.proxy_port} {ch.node_ip}")
     return True
@@ -189,8 +196,7 @@ def disconnect_channel(ch: Channel):
         ch.state = "disconnected"; ch.node_id = ""; ch.node_name = ""; ch.node_ip = ""
         ch.node_country = ""; ch.node_owner = ""; ch.node_location = ""; ch.node_ip_type = ""
         ch.node_latency = 0; ch.error = ""
-    try: (CONFIG_DIR / f"ch{ch.index}.ovpn").unlink(missing_ok=True)
-    except: pass
+        # Keep config file for watchdog retry
     log(f"[CH{ch.index}] Disconnected")
 
 def start_all_proxies():
@@ -750,7 +756,14 @@ def channel_watchdog():
                         else:
                             continue
                     if ch.state in ("disconnected", "error") and ch.force_country:
-                        node = get_best_node_for_country(ch.force_country, ch.force_ip_type)
+                        # Try last known node first (same IP)
+                        node = None
+                        last = ch.last_node_data
+                        if last and last.get("config_text"):
+                            node = last
+                            log(f"[WD CH{ch.index}] Retry same node {last.get(chr(105)+chr(112),chr(34)+chr(34))}")
+                        else:
+                            node = get_best_node_for_country(ch.force_country, ch.force_ip_type)
                         if node:
                             log(f"[WD CH{ch.index}] Reconnect {ch.force_country} {ch.force_ip_type}")
                             # Stagger reconnects so 6 channels don't fight
