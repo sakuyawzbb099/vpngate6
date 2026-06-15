@@ -179,11 +179,30 @@ def connect_channel(ch: Channel, node: dict) -> bool:
             ch.state = "error"; ch.error = "AUTH_FAILED"; stop_process(proc); return False
     if not ok:
         stop_process(proc); ch.state = "error"; ch.error = tail[-1][:200] if tail else "timeout"; return False
+    # Quick connectivity test through the tunnel
+    tunnel_ok = False
+    for _try in range(3):
+        try:
+            r = subprocess.run(["ping","-I",ch.tun,"-c","1","-W","3","8.8.8.8"],
+                             capture_output=True, timeout=5)
+            if r.returncode == 0:
+                tunnel_ok = True
+                break
+        except: pass
+        time.sleep(1)
+    if not tunnel_ok:
+        log(f"[CH{ch.index}] Tunnel dead, switching node...")
+        stop_process(proc)
+        ch.state = "error"
+        ch.error = "tunnel unreachable"
+        ch.last_node_data = None
+        return False
+
     with ch.lock:
             ch.process = proc
             ch.state = "connected"
             ch.last_heartbeat = time.time()
-            ch.last_node_data = node  # Save for reconnection
+            ch.last_node_data = node
     setup_policy_routing(ch.tun, 100 + ch.index)
     log(f"[CH{ch.index}] Connected! {ch.tun} :{ch.proxy_port} {ch.node_ip}")
     return True
