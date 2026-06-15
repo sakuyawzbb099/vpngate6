@@ -69,6 +69,7 @@ class Channel:
         self.tun = f"tun{index}"
         self.proxy_port = PROXY_BASE_PORT + index
         self.force_country = ""
+        self.force_ip_type = ""
         self.state = "disconnected"
         self.node_id = ""
         self.node_name = ""
@@ -85,7 +86,7 @@ class Channel:
 
     def to_dict(self) -> dict:
         d = {"index": self.index, "tun": self.tun, "proxy_port": self.proxy_port,
-             "force_country": self.force_country, "state": self.state,
+             "force_country": self.force_country, "force_ip_type": self.force_ip_type, "state": self.state,
              "node_id": self.node_id, "node_name": self.node_name, "node_ip": self.node_ip,
              "node_country": self.node_country, "node_owner": self.node_owner,
              "node_location": self.node_location, "node_ip_type": self.node_ip_type,
@@ -236,6 +237,23 @@ def fetch_nodes() -> list[dict[str, Any]]:
     nodes = nodes[:300]
     return nodes
 
+def manual_fetch():
+    """Manually trigger a node fetch."""
+    try:
+        nodes = fetch_nodes()
+        if nodes:
+            try: vpn_utils.enrich_ip_info(nodes)
+            except: pass
+            with nodes_cache_lock:
+                global nodes_cache
+                nodes_cache = nodes
+            stripped = [{k:v for k,v in n.items() if k!="config_text"} for n in nodes]
+            write_json(NODES_FILE, stripped)
+            log(f"[manual_fetch] {len(nodes)} nodes fetched")
+    except Exception as e:
+        log(f"[manual_fetch] Error: {e}")
+
+
 def collector_loop():
     global nodes_cache
     while True:
@@ -255,11 +273,14 @@ def collector_loop():
         time.sleep(FETCH_INTERVAL)
 
 # === Channel Manager ===
-def get_best_node_for_country(country: str) -> dict | None:
+def get_best_node_for_country(country: str, ip_type: str = "") -> dict | None:
     with nodes_cache_lock: candidates = list(nodes_cache)
     if not candidates: return None
-    if country: filtered = [n for n in candidates if country.lower() in n.get("country_long","").lower()]
-    else: filtered = candidates
+    filtered = candidates
+    if country:
+        filtered = [n for n in filtered if country.lower() in n.get("country_long","").lower()]
+    if ip_type:
+        filtered = [n for n in filtered if n.get("ip_type","") == ip_type]
     if not filtered: return None
     pool = filtered[:min(30, len(filtered))]
     return random.choice(pool) if pool else None
@@ -352,6 +373,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
     <select id="f_country"><option value="">所有国家</option></select>
     <select id="f_type"><option value="">所有IP类型</option><option value="residential">住宅IP</option><option value="hosting">机房IP</option></select>
     <button class="btn" onclick="refreshNodes()">刷新</button>
+    <button class="btn" onclick="fetchNodes()">获取节点</button>
     <span id="rc" style="color:#6b7280;font-size:12px;margin-left:auto"></span>
   </div>
   <div style="overflow-x:auto">
@@ -397,6 +419,10 @@ function render(d){
       var co=d.countries[j]; h+='<option value="'+co+'"'+(c.force_country===co?' selected':'')+'>'+co+'</option>';
     }
     h+='</select>';
+    h+='<select id="ipt_'+c.index+'"'+(c.state==='connecting'?' disabled':'')+'>';
+    h+='<option value="">全部IP</option><option value="residential"'+(c.force_ip_type==='residential'?' selected':'')+'>住宅</option>';
+    h+='<option value="hosting"'+(c.force_ip_type==='hosting'?' selected':'')+'>机房</option>';
+    h+='<option value="mobile"'+(c.force_ip_type==='mobile'?' selected':'')+'>移动</option></select>';
     if(c.state==='connected') h+='<button class="btn d" onclick="dc('+c.index+')">断开</button>';
     else h+='<button class="btn" onclick="connectAuto('+c.index+')"'+(c.state==='connecting'?' disabled':'')+'>连接</button>';
     h+='</div></div>';
@@ -404,7 +430,15 @@ function render(d){
   g.innerHTML=h; document.getElementById('nc').textContent='节点: '+(d.node_count||0);
 }
 async function rf(){try{var r=await fetch('/api/status');var d=await r.json();render(d)}catch(e){}}
-async function connectAuto(i){var s=document.getElementById('cs_'+i);var c=s?s.value:'';await fetch('/api/channel/'+i+'/connect?country='+encodeURIComponent(c),{method:'POST'});setTimeout(rf,500)}
+async function connectAuto(i){
+  var s=document.getElementById('cs_'+i);var c=s?s.value:'';
+  var t=document.getElementById('ipt_'+i);var ip=t?t.value:'';
+  await fetch('/api/channel/'+i+'/connect?country='+encodeURIComponent(c)+'&ip_type='+encodeURIComponent(ip),{method:'POST'});
+  setTimeout(rf,500)}
+async function fetchNodes(){
+  document.getElementById('rc').textContent='获取中...';
+  await fetch('/api/fetch_nodes',{method:'POST'});
+  setTimeout(refreshNodes,5000);}
 async function dc(i){await fetch('/api/channel/'+i+'/disconnect',{method:'POST'});rf()}
 rf();setInterval(rf,3000);
 
@@ -564,6 +598,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
             return
 
+        if path == "/api/fetch_nodes":
+            threading.Thread(target=manual_fetch, daemon=True).start()
+            self.send_json({"ok": True, "message": "Fetching nodes..."})
+            return
+
         m = re.match(r"^/api/channel/(\d+)/(connect|disconnect)$", path)
         if not m: self.send_json({"error":"not found"}, HTTPStatus.NOT_FOUND); return
         idx = int(m.group(1)); action = m.group(2)
@@ -572,17 +611,20 @@ class Handler(BaseHTTPRequestHandler):
         if action == "disconnect":
             disconnect_channel(ch)
             ch.force_country = ""
+            ch.force_ip_type = ""
             self.send_json({"ok":True,"channel":ch.to_dict()})
         else:
             node_id = params.get("node_id",[None])[0]
             country = params.get("country",[""])[0]
+            ip_type = params.get("ip_type",[""])[0]
             if node_id:
                 node = get_node_by_id(node_id)
                 if not node: self.send_json({"error":"node not found"}, HTTPStatus.NOT_FOUND); return
             else:
-                node = get_best_node_for_country(country)
+                node = get_best_node_for_country(country, ip_type)
                 if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
                 if country: ch.force_country = country
+                ch.force_ip_type = ip_type
             ok = connect_channel(ch, node)
             self.send_json({"ok":ok,"channel":ch.to_dict()})
 
@@ -595,6 +637,7 @@ def main():
     for ch in channels:
         c = ch_cfg.get(str(ch.index),{})
         ch.force_country = c.get("force_country","")
+        ch.force_ip_type = c.get("force_ip_type","")
     start_all_proxies()
     log("[init] 6 proxies started")
     threading.Thread(target=collector_loop, daemon=True).start()
