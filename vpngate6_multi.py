@@ -380,6 +380,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
   <h1>AimiliVPN</h1>
   <span class="bdg">6通道</span>
   <span class="nc" id="nc">节点: 加载中...</span>
+  <button class="btn" style="background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.1);color:#e0e0e0" onclick="showAdmin()">管理员</button>
 </div>
 <div class="grid" id="grid"></div>
 
@@ -529,6 +530,35 @@ async function loadCountries(){
 }
 loadCountries(); refreshNodes();
 </script>
+
+<div class="modal" id="adminModal"><div class="modal-c">
+  <h3>修改账号密码</h3>
+  <div class="fg" style="margin-bottom:12px"><label>当前账号</label><input type="text" id="a_user" style="width:100%;padding:8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:13px;outline:none"></div>
+  <div class="fg" style="margin-bottom:12px"><label>当前密码</label><input type="password" id="a_pass" style="width:100%;padding:8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:13px;outline:none"></div>
+  <div class="fg" style="margin-bottom:12px"><label>新密码</label><input type="password" id="a_newpass" style="width:100%;padding:8px;background:#0f0f13;border:1px solid rgba(255,255,255,0.1);border-radius:8px;color:#e0e0e0;font-size:13px;outline:none"></div>
+  <div class="btns" style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+    <button class="btn" onclick="changePwd()">确认修改</button>
+    <button class="btn d" onclick="document.getElementById('adminModal').classList.remove('show')">取消</button>
+  </div>
+  <div id="a_msg" style="color:#22c55e;font-size:12px;margin-top:8px;display:none"></div>
+</div></div>
+
+<script>
+function showAdmin(){
+  document.getElementById("adminModal").classList.add("show");
+  document.getElementById("a_msg").style.display="none";
+}
+async function changePwd(){
+  var u=document.getElementById("a_user").value;
+  var p=document.getElementById("a_pass").value;
+  var n=document.getElementById("a_newpass").value;
+  var r=await fetch("/api/admin/change_password",{method:"POST",body:new URLSearchParams({username:u,password:p,new_password:n})});
+  var d=await r.json();
+  var msg=document.getElementById("a_msg");msg.style.display="block";
+  if(d.ok){msg.style.color="#22c55e";msg.textContent="密码修改成功！请重新登录";setTimeout(function(){location.href="/"},2000)}
+  else{msg.style.color="#ef4444";msg.textContent=d.error||"修改失败"}
+}
+</script>
 </body>
 </html>"""
 
@@ -637,6 +667,30 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/fetch_nodes":
             res = manual_fetch()
             self.send_json({"ok": True, "new": res["new"], "dup": res["dup"], "total": res["total"]})
+            return
+
+        # Change password
+        if path == "/api/admin/change_password":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8", errors="replace") if length else ""
+                p = urllib.parse.parse_qs(body)
+                user = (p.get("username", [""])[0] or "").strip()
+                pwd = (p.get("password", [""])[0] or "").strip()
+                new_pwd = (p.get("new_password", [""])[0] or "").strip()
+                if len(new_pwd) < 4:
+                    self.send_json({"ok": False, "error": "密码至少4位"}, HTTPStatus.BAD_REQUEST)
+                    return
+                cfg = load_auth_config()
+                if user == cfg.get("username", "admin") and pwd == cfg.get("password", "admin"):
+                    cfg["password"] = new_pwd
+                    write_json(DATA_DIR / "ui_auth.json", cfg)
+                    log(f"[auth] Password changed by {user}")
+                    self.send_json({"ok": True})
+                else:
+                    self.send_json({"ok": False, "error": "当前账号或密码错误"}, HTTPStatus.UNAUTHORIZED)
+            except Exception as e:
+                self.send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
             return
 
         m = re.match(r"^/api/channel/(\d+)/(connect|disconnect)$", path)
