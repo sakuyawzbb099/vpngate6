@@ -70,6 +70,7 @@ class Channel:
         self.proxy_port = PROXY_BASE_PORT + index
         self.force_country = ""
         self.force_ip_type = ""
+        self.enabled = False
         self.state = "disconnected"
         self.node_id = ""
         self.node_name = ""
@@ -87,7 +88,7 @@ class Channel:
 
     def to_dict(self) -> dict:
         d = {"index": self.index, "tun": self.tun, "proxy_port": self.proxy_port,
-             "force_country": self.force_country, "force_ip_type": self.force_ip_type, "state": self.state,
+             "force_country": self.force_country, "force_ip_type": self.force_ip_type, "enabled": self.enabled, "state": self.state,
              "node_id": self.node_id, "node_name": self.node_name, "node_ip": self.node_ip,
              "node_country": self.node_country, "node_owner": self.node_owner,
              "node_location": self.node_location, "node_ip_type": self.node_ip_type,
@@ -115,6 +116,7 @@ def save_channels():
         data[str(ch.index)] = {
             "force_country": ch.force_country,
             "force_ip_type": ch.force_ip_type,
+            "enabled": ch.enabled,
         }
     write_json(CHANNELS_FILE, data)
 
@@ -499,6 +501,11 @@ function render(d){
   g.innerHTML=h; document.getElementById('nc').textContent='节点: '+(d.node_count||0);
 }
 async function rf(){try{var r=await fetch('/api/status');var d=await r.json();render(d)}catch(e){}}
+async function toggleChannel(i){
+  var el=document.getElementById('tog_'+i);
+  await fetch('/api/channel/'+i+'/toggle?enabled='+(el.checked?'1':'0'),{method:'POST'});
+  if(!el.checked) dc(i);
+}
 async function connectAuto(i){
   var s=document.getElementById('cs_'+i);var c=s?s.value:'';
   var t=document.getElementById('ipt_'+i);var ip=t?t.value:'';
@@ -707,6 +714,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": False, "error": str(e)}, HTTPStatus.BAD_REQUEST)
             return
 
+        if re.match(r"^/api/channel/\d+/toggle$", path):
+            m2 = re.match(r"/api/channel/(\d+)/toggle", path)
+            if m2:
+                idx2 = int(m2.group(1))
+                en = params.get("enabled",["0"])[0] == "1"
+                channels[idx2].enabled = en
+                save_channels()
+                self.send_json({"ok":True, "enabled": en})
+                return
+
         if path == "/api/fetch_nodes":
             res = manual_fetch()
             self.send_json({"ok": True, "new": res["new"], "dup": res["dup"], "total": res["total"]})
@@ -813,7 +830,7 @@ def channel_watchdog():
                                 # Fall through to reconnect
                             else:
                                 continue
-                    if ch.state in ("disconnected", "error") and ch.force_country:
+                    if ch.state in ("disconnected", "error") and ch.force_country and ch.enabled:
                         # Try last known node first (same IP)
                         node = None
                         last = ch.last_node_data
@@ -844,6 +861,7 @@ def main():
         c = ch_cfg.get(str(ch.index),{})
         ch.force_country = c.get("force_country","")
         ch.force_ip_type = c.get("force_ip_type","")
+        ch.enabled = c.get("enabled", False)
     start_all_proxies()
     log("[init] 6 proxies started")
     threading.Thread(target=collector_loop, daemon=True).start()
