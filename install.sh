@@ -103,7 +103,7 @@ LOGINEOF
 
     # Generate default auth if missing
     if [ ! -f "$INSTALL_DIR/vpngate_data/ui_auth.json" ]; then
-        echo '{"username":"admin","password": "***"}' > "$INSTALL_DIR/vpngate_data/ui_auth.json"
+        echo '{"username":"admin","password": "admin"}' > "$INSTALL_DIR/vpngate_data/ui_auth.json"
     fi
 
     chmod -R 755 "$INSTALL_DIR"
