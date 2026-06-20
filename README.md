@@ -9,12 +9,18 @@
 
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/sakuyawzbb099/vpngate6/main/install.sh)
-`bash
+```
+
+安装后访问 `http://<VPS_IP>:8787/` 进入管理面板。  
+默认账号密码从旧的 `ui_auth.json` 读取，可在 `/opt/aimilivpn/vpngate_data/ui_auth.json` 中修改。
+
+## 🗑️ 一键卸载
+
+```bash
 bash <(curl -Ls https://raw.githubusercontent.com/sakuyawzbb099/vpngate6/main/install.sh) uninstall
 ```
 
-一键卸载所有文件和服务。
-```
+卸载所有文件和服务。
 
 安装后访问 `http://<VPS_IP>:8787/` 进入管理面板。  
 默认账号密码从旧的 `ui_auth.json` 读取，可在 `/opt/aimilivpn/vpngate_data/ui_auth.json` 中修改。
