@@ -494,8 +494,8 @@ function render(d){
     h+='<option value="">全部IP</option><option value="residential"'+(savedIpt==='residential'||c.force_ip_type==='residential'?' selected':'')+'>住宅</option>';
     h+='<option value="hosting"'+(savedIpt==='hosting'||c.force_ip_type==='hosting'?' selected':'')+'>机房</option>';
     h+='<option value="mobile"'+(savedIpt==='mobile'||c.force_ip_type==='mobile'?' selected':'')+'>移动</option></select>';
-    if(c.state==='connected') h+='<button class="btn d" onclick="dc('+c.index+')">断开</button>';
-    else h+='<button class="btn" onclick="connectAuto('+c.index+')"'+(c.state==='connecting'?' disabled':'')+'>连接</button>';
+    h+='<button class="btn" onclick="connectAuto('+c.index+')"'+(c.state==='connecting'||c.state==='connected'?' disabled':'')+'>连接</button>';
+    h+='<button class="btn d" onclick="dc('+c.index+')"'+(c.state!=='connected'?' disabled':'')+'>断开</button>';
     h+='</div></div>';
   }
   g.innerHTML=h; document.getElementById('nc').textContent='节点: '+(d.node_count||0);
