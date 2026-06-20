@@ -187,7 +187,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
         line = line.strip(); tail.append(line); tail = tail[-20:]
         if "initialization sequence completed" in line.lower(): ok = True; break
         if "auth_failed" in line.lower() or "authentication failed" in line.lower():
-            ch.state = "error"; ch.error = "AUTH_FAILED"; stop_process(proc); return False
+            ch.state = "error"; ch.error = "AUTH_FAILED"; ch.last_node_data = None; stop_process(proc); return False
     if not ok:
         stop_process(proc); ch.state = "error"; ch.error = tail[-1][:200] if tail else "timeout"; return False
     # Quick connectivity test through the tunnel
@@ -861,7 +861,7 @@ def main():
         c = ch_cfg.get(str(ch.index),{})
         ch.force_country = c.get("force_country","")
         ch.force_ip_type = c.get("force_ip_type","")
-        ch.enabled = c.get("enabled", False)
+        ch.enabled = c.get("enabled", bool(ch.force_country))
     start_all_proxies()
     log("[init] 6 proxies started")
     threading.Thread(target=collector_loop, daemon=True).start()
