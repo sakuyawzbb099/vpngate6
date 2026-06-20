@@ -11,6 +11,21 @@ REPO_OWNER="${1:-sakuyawzbb099}"
 REPO_NAME="${2:-vpngate6}"
 BRANCH="main"
 
+# === 卸载功能 ===
+if [ "${1:-}" = "uninstall" ] || [ "${1:-}" = "卸载" ]; then
+    echo -e "${YELLOW}正在卸载 AimiliVPN...${NC}"
+    systemctl stop ${SERVICE_NAME} 2>/dev/null || true
+    systemctl disable ${SERVICE_NAME} 2>/dev/null || true
+    rm -f /lib/systemd/system/${SERVICE_NAME}.service
+    systemctl daemon-reload
+    rm -rf "$INSTALL_DIR"
+    rm -f /usr/bin/ml
+    rm -f /etc/sysctl.d/99-${SERVICE_NAME}.conf
+    pkill -f "vpngate6_multi\|proxy_server_multi" 2>/dev/null || true
+    echo -e "${GREEN}卸载完成！${NC}"
+    exit 0
+fi
+
 detect_distro() {
     if [ -f /etc/os-release ]; then . /etc/os-release; OS=$ID; else OS=$(uname -s | tr '[:upper:]' '[:lower:]'); fi
     case "$OS" in
@@ -88,7 +103,7 @@ LOGINEOF
 
     # Generate default auth if missing
     if [ ! -f "$INSTALL_DIR/vpngate_data/ui_auth.json" ]; then
-        echo '{"username":"admin","password":"admin"}' > "$INSTALL_DIR/vpngate_data/ui_auth.json"
+        echo '{"username":"admin","password": "***"}' > "$INSTALL_DIR/vpngate_data/ui_auth.json"
     fi
 
     chmod -R 755 "$INSTALL_DIR"
@@ -125,6 +140,17 @@ case "${1:-status}" in
     start)   systemctl start aimilivpn 2>/dev/null ;;
     stop)    systemctl stop aimilivpn 2>/dev/null ;;
     restart) systemctl restart aimilivpn 2>/dev/null ;;
+    uninstall|卸载)
+        echo -e "\033[0;33m正在卸载 AimiliVPN...\033[0m"
+        systemctl stop aimilivpn 2>/dev/null || true
+        systemctl disable aimilivpn 2>/dev/null || true
+        rm -f /lib/systemd/system/aimilivpn.service
+        systemctl daemon-reload
+        rm -rf /opt/aimilivpn
+        rm -f /usr/bin/ml
+        rm -f /etc/sysctl.d/99-aimilivpn.conf
+        pkill -f "vpngate6_multi\|proxy_server_multi" 2>/dev/null || true
+        echo -e "\033[0;32m卸载完成！\033[0m" ;;
     status)
         echo "=== AimiliVPN 6-Channel ==="
         curl -s http://localhost:8787/api/status | python3 -c "
@@ -135,7 +161,7 @@ for c in d['channels']:
     print(f'CH{c[\"index\"]}: {s:15s} {co:20s} IP={ip:16s} :{c[\"proxy_port\"]}')
 print(f'--- {d[\"node_count\"]} nodes ---')" 2>/dev/null || systemctl status aimilivpn --no-pager ;;
     logs)    journalctl -u aimilivpn --no-pager -n 50 -f ;;
-    *)       echo "用法: ml {start|stop|restart|status|logs}" ;;
+    *)       echo "用法: ml {start|stop|restart|status|logs|uninstall}" ;;
 esac
 MLEOF
     chmod +x /usr/bin/ml
@@ -175,3 +201,4 @@ echo -e "  默认密码:  ${CYAN}admin${NC}"
 echo -e "  代理端口:  ${CYAN}7928~7933${NC} (tun0~tun5)"
 echo -e "  状态:      ${CYAN}ml status${NC}"
 echo -e "  日志:      ${CYAN}ml logs${NC}"
+echo -e "  卸载:      ${CYAN}ml uninstall${NC}"
