@@ -148,6 +148,7 @@ def openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
     cmd = ["openvpn","--config",config_file,"--dev",tun_dev,"--dev-type","tun",
            "--pull-filter","ignore","route-ipv6","--pull-filter","ignore","ifconfig-ipv6",
            "--pull-filter","ignore","inactive",
+           "--remote-cert-tls","server",
            "--route-delay","2","--connect-retry-max","999","--connect-timeout","15",
            "--keepalive","10","60",
            "--resolv-retry","infinite",
