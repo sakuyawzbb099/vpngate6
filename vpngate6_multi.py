@@ -147,8 +147,7 @@ def setup_policy_routing(tun_dev: str, table: int):
 def openvpn_cmd(config_file: str, tun_dev: str) -> list[str]:
     cmd = ["openvpn","--config",config_file,"--dev",tun_dev,"--dev-type","tun",
            "--pull-filter","ignore","route-ipv6","--pull-filter","ignore","ifconfig-ipv6",
-           "--pull-filter","ignore","inactive",
-           "--remote-cert-tls","server",
+           "--pull-filter","ignore","inactive"
            "--route-delay","2","--connect-retry-max","999","--connect-timeout","15",
            "--keepalive","10","60",
            "--resolv-retry","infinite",
@@ -812,17 +811,21 @@ def channel_watchdog():
                             log(f"[WD CH{ch.index}] Connection lost")
                             # Fall through to reconnect
                         else:
-                            # Tunnel health check every 30s via ping
-                            tun_ok = True
-                            try:
-                                r = subprocess.run(["ping","-I",ch.tun,"-c","1","-W","2","8.8.8.8"],
-                                                 capture_output=True, timeout=4)
-                                if r.returncode != 0:
-                                    tun_ok = False
-                            except:
-                                tun_ok = False
-                            if not tun_ok:
-                                log(f"[WD CH{ch.index}] Tunnel dead, reconnecting...")
+                            # Tunnel health check - try 2 pings before declaring dead
+                            fail_count = 0
+                            for _pi in range(2):
+                                try:
+                                    r = subprocess.run(["ping","-I",ch.tun,"-c","1","-W","3","8.8.8.8"],
+                                                     capture_output=True, timeout=5)
+                                    if r.returncode != 0:
+                                        fail_count += 1
+                                except:
+                                    fail_count += 1
+                                if fail_count == 0:
+                                    break
+                                time.sleep(1)
+                            if fail_count >= 2:
+                                log(f"[WD CH{ch.index}] 2 pings failed, reconnecting...")
                                 stop_process(ch.process)
                                 ch.process = None
                                 cleanup_policy_routing(100 + ch.index)
