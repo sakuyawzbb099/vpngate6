@@ -178,7 +178,7 @@ def connect_channel(ch: Channel, node: dict) -> bool:
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     except Exception as e:
-        ch.state = "error"; ch.error = str(e); return False
+        ch.state = "error"; ch.error = str(e); ch.last_node_data = None; return False
     ok = False; deadline = time.time() + 35; tail = []
     while time.time() < deadline:
         try: line = proc.stdout.readline()
