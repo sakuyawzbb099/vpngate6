@@ -776,6 +776,7 @@ class Handler(BaseHTTPRequestHandler):
                 if node_country: ch.force_country = node_country
                 node_iptype = node.get("ip_type","")
                 if node_iptype: ch.force_ip_type = node_iptype
+                ch.enabled = True
                 save_channels()
             else:
                 used_ips = set(c.node_ip for c in channels if c.state == "connected" and c.node_ip)
@@ -783,6 +784,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not node: self.send_json({"error":"No nodes"}, HTTPStatus.SERVICE_UNAVAILABLE); return
                 if country: ch.force_country = country
                 ch.force_ip_type = ip_type
+                ch.enabled = True
                 save_channels()
             ok = connect_channel(ch, node)
             self.send_json({"ok":ok,"channel":ch.to_dict()})
